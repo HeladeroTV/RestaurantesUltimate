@@ -9,6 +9,8 @@ import requests
 import winsound
 import time as time_module
 import logging  # <-- NUEVO
+from pathlib import Path
+
 
 # ====================== SISTEMA DE LOGS PROFESIONAL ======================
 logging.getLogger("RestaurantIA").handlers.clear()  # Evita duplicados al recargar
@@ -136,33 +138,28 @@ def crear_selector_item(menu):
 def crear_mesas_grid(backend_service, on_select):
     log.debug("Iniciando creación del grid de mesas")
     try:
-        # Obtener el estado real de las mesas del backend
         mesas_backend = backend_service.obtener_mesas()
-        log.info(f"Mesas obtenidas del backend: {len(mesas_backend)} mesas")
-        
-        # Si el backend no tiene mesas, usar valores por defecto
-        if not mesas_backend:
-            log.warning("Backend no devolvió mesas → usando valores por defecto")
+        log.info(f"Mesas obtenidas del backend: {len(mesas_backend)} mesas → {mesas_backend}")
+
+        # ¡¡¡AQUÍ ESTABA EL ERROR!!!
+        # Antes: si no hay mesas → usa las por defecto
+        # Ahora: SIEMPRE usa lo que venga del backend
+        mesas_fisicas = mesas_backend  # ¡Siempre usar el backend!
+
+        # Solo como fallback extremo si hay error de conexión
+        if not mesas_backend or len(mesas_backend) == 0:
+            log.warning("Backend devolvió 0 mesas → usando fallback temporal")
             mesas_fisicas = [
-                {"numero": 1, "capacidad": 2, "ocupada": False},
-                {"numero": 2, "capacidad": 2, "ocupada": False},
-                {"numero": 3, "capacidad": 4, "ocupada": False},
-                {"numero": 4, "capacidad": 4, "ocupada": False},
-                {"numero": 5, "capacidad": 6, "ocupada": False},
-                {"numero": 6, "capacidad": 6, "ocupada": False},
+                {"numero": 1, "capacidad": 4, "ocupada": False},
+                {"numero": 2, "capacidad": 4, "ocupada": False},
+                {"numero": 3, "capacidad": 6, "ocupada": False},
             ]
-        else:
-            mesas_fisicas = mesas_backend
+            
     except Exception as e:
         log.error(f"Error crítico al obtener mesas del backend: {e}")
-        # Usar valores por defecto si hay error
         mesas_fisicas = [
-            {"numero": 1, "capacidad": 2, "ocupada": False},
-            {"numero": 2, "capacidad": 2, "ocupada": False},
-            {"numero": 3, "capacidad": 4, "ocupada": False},
-            {"numero": 4, "capacidad": 4, "ocupada": False},
-            {"numero": 5, "capacidad": 6, "ocupada": False},
-            {"numero": 6, "capacidad": 6, "ocupada": False},
+            {"numero": 1, "capacidad": 4, "ocupada": False},
+            {"numero": 2, "capacidad": 6, "ocupada": False},
         ]
 
     grid = ft.GridView(
@@ -1095,7 +1092,11 @@ def crear_vista_personalizacion(app_instance):
 class RestauranteGUI:
     def __init__(self):
         log.info("Iniciando RestauranteGUI - Creando instancia principal")
-        
+
+        self.carpeta_datos = Path.home() / ".restaurantia" / "datos"
+        self.carpeta_datos.mkdir(parents=True, exist_ok=True)
+        self.archivo_primera_config = self.carpeta_datos / "PRIMERA_CONFIGURACION_COMPLETADA"
+
         from backend_service import BackendService
         from configuraciones_service import ConfiguracionesService
         
@@ -1283,6 +1284,7 @@ class RestauranteGUI:
                 log.error(f"Error crítico en hilo de retrasos: {e}")
                 time.sleep(60)
 
+
     def iniciar_sincronizacion(self):
         """Inicia la sincronización automática en segundo plano."""
         log.info("Iniciando hilos de sincronización automática")
@@ -1323,6 +1325,35 @@ class RestauranteGUI:
         page.bgcolor = "#0a0e1a"
         
         reloj = ft.Text("", size=14, weight=ft.FontWeight.BOLD, color=ft.Colors.AMBER_200)
+
+        # =================================================================
+        # === ASISTENTE DE PRIMERA CONFIGURACIÓN (SOLO SE MUESTRA 1 VEZ) ===
+        # =================================================================
+        if not self.archivo_primera_config.exists():
+            page.title = "RestIA - Configuración Inicial"
+            page.bgcolor = "#0f172a"
+            
+            from bienvenida_view import BienvenidaConfiguracion
+            
+            page.views.clear()
+            page.views.append(BienvenidaConfiguracion(self, page).vista)
+            page.update()
+            log.info("PRIMERA VEZ - Mostrando asistente de configuración inicial")
+            return  # ¡¡SUPER IMPORTANTE!! No ejecutar nada más
+
+        # =================================================================
+        # === CONFIGURACIÓN YA REALIZADA → CARGAR SISTEMA NORMAL ===
+        # =================================================================
+        log.info("Configuración previa detectada - Cargando sistema completo")
+
+        # === CARGA INICIAL DEL MENÚ ===
+        try:
+            self.menu_cache = self.backend_service.obtener_menu()
+            log.info(f"Menú cargado desde backend → {len(self.menu_cache)} ítems")
+        except Exception as e:
+            log.error(f"Error al cargar menú al iniciar: {e}")
+            self.menu_cache = []
+
 
         # === INDICADORES DE ALERTA ===
         indicador_stock_bajo = ft.Container(

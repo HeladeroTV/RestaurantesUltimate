@@ -15,6 +15,9 @@ import glob
 import logging  # ← AÑADIDO
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from pathlib import Path
+from fastapi import WebSocket, WebSocketDisconnect
+from typing import List
+import asyncio
 
 # Crear carpeta de logs si no existe
 LOGS_DIR = Path("logs")
@@ -263,12 +266,36 @@ def crear_pedido(pedido: PedidoCreate, conn: psycopg2.extensions.connection = De
         result = cursor.fetchone()
         pedido_id_nuevo = result['id']
 
-        # --- CONSUMIR STOCK ---
+        # === CONSUMIR STOCK + ALERTA DE STOCK BAJO EN TIEMPO REAL ===
         for consumo in ingredientes_a_consumir:
             cursor.execute("""
-                UPDATE inventario SET cantidad_disponible = cantidad_disponible - %s WHERE id = %s
+                UPDATE inventario 
+                SET cantidad_disponible = cantidad_disponible - %s,
+                    fecha_actualizacion = CURRENT_TIMESTAMP
+                WHERE id = %s
+                RETURNING nombre, cantidad_disponible, cantidad_minima_alerta, unidad_medida
             """, (consumo['cantidad'], consumo['id']))
-            log.debug(f"Stock actualizado → Ingrediente ID {consumo['id']} | -{consumo['cantidad']} unidades")
+            
+            ing = cursor.fetchone()
+            if ing:
+                nombre_ing = ing['nombre']
+                disponible = float(ing['cantidad_disponible'])
+                minimo_alerta = float(ing['cantidad_minima_alerta'])
+                unidad = ing['unidad_medida'] or "unidades"
+
+                log.debug(f"Stock actualizado → {nombre_ing} | Quedan: {disponible} {unidad}")
+
+                # ENVIAR ALERTA SI ESTÁ BAJO O CRÍTICO
+                if disponible <= minimo_alerta:
+                    alerta = {
+                        "ingrediente": nombre_ing,
+                        "disponible": round(disponible, 2),
+                        "minimo": minimo_alerta,
+                        "unidad": unidad,
+                        "mensaje": f"¡Stock crítico de {nombre_ing}! Solo quedan {disponible} {unidad}"
+                    }
+                    asyncio.create_task(broadcast_alerta("stock_bajo", alerta))
+                    log.warning(f"ALERTA STOCK BAJO ENVIADA → {nombre_ing} ({disponible} ≤ {minimo_alerta})")
 
         conn.commit()
         
@@ -370,66 +397,15 @@ def actualizar_estado_pedido(pedido_id: int, estado: str, conn = Depends(get_db)
 # --- FIN MODIFICACIÓN ---
 
 @app.get("/mesas")
-def obtener_mesas(conn: psycopg2.extensions.connection = Depends(get_db)):
-    """
-    Obtiene el estado real de todas las mesas desde la base de datos.
-    """
-    log.debug("GET /mesas - Consultando estado actual de mesas")
-
-    try:
-        with conn.cursor() as cursor:
-            mesas_result = []
-            mesas_fisicas = [
-                {"numero": 1, "capacidad": 2},
-                {"numero": 2, "capacidad": 2},
-                {"numero": 3, "capacidad": 4},
-                {"numero": 4, "capacidad": 4},
-                {"numero": 5, "capacidad": 6},
-                {"numero": 6, "capacidad": 6},
-            ]
-            
-            ocupadas_count = 0
-            for mesa in mesas_fisicas:
-                cursor.execute("""
-                    SELECT COUNT(*) as count
-                    FROM pedidos 
-                    WHERE mesa_numero = %s 
-                    AND estado IN ('Pendiente', 'En preparacion', 'Listo')
-                """, (mesa["numero"],))
-                
-                result = cursor.fetchone()
-                count = result['count'] if result and result['count'] is not None else 0
-                ocupada = count > 0
-                if ocupada:
-                    ocupadas_count += 1
-
-                mesas_result.append({
-                    "numero": mesa["numero"],
-                    "capacidad": mesa["capacidad"],
-                    "ocupada": ocupada
-                })
-            
-            # Mesa virtual
-            mesas_result.append({
-                "numero": 99,
-                "capacidad": 1,
-                "ocupada": False,
-                "es_virtual": True
-            })
-            
-            libres = len(mesas_fisicas) - ocupadas_count
-            log.info(f"Estado de mesas enviado → {libres} libres | {ocupadas_count} ocupadas | 1 digital")
-            return mesas_result
-            
-    except Exception as e:
-        log.error(f"ERROR CRÍTICO en obtener_mesas → {e}", exc_info=True)
-        # Devolver fallback seguro
-        fallback = [
-            {"numero": i, "capacidad": c, "ocupada": False} 
-            for i, c in [(1,2),(2,2),(3,4),(4,4),(5,6),(6,6)]
-        ] + [{"numero": 99, "capacidad": 1, "ocupada": False, "es_virtual": True}]
-        log.warning("Se devolvió estado por defecto (todas libres) por error en BD")
-        return fallback
+def obtener_mesas(conn=Depends(get_db)):
+    """Este es el que usa el frontend → debe devolver TODAS las mesas"""
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT numero, capacidad, FALSE as ocupada FROM mesas WHERE numero != 99 ORDER BY numero")
+        filas = cursor.fetchall()
+        mesas = [{"numero": r["numero"], "capacidad": r["capacidad"], "ocupada": r["ocupada"]} for r in filas]
+        # Agregar mesa virtual
+        mesas.append({"numero": 99, "capacidad": 100, "ocupada": False})
+        return mesas
 
 # Endpoint para inicializar menú
 @app.post("/menu/inicializar")
@@ -1191,51 +1167,145 @@ def obtener_ventas_por_hora(
         raise HTTPException(status_code=500, detail=f"Error interno del servidor al calcular ventas por hora: {str(e)}")
 
 
-# --- NUEVO ENDPOINT: Eficiencia de Cocina ---
 @app.get("/reportes/eficiencia_cocina")
-def get_eficiencia_cocina(tipo: str, start_date: str, end_date: str, conn = Depends(get_db)):
-    log.info(f"GET /reportes/eficiencia_cocina → Analizando rendimiento cocina | {start_date} → {end_date}")
+def get_eficiencia_cocina(
+    tipo: str,
+    start_date: str,
+    end_date: str,
+    conn = Depends(get_db)
+):
+    log.info(f"REPORTE EFICIENCIA COCINA → {tipo} | {start_date} → {end_date}")
 
     with conn.cursor() as cursor:
         query = """
-            SELECT
-                id,
-                hora_inicio_cocina,
-                hora_fin_cocina,
-                (EXTRACT(EPOCH FROM (hora_fin_cocina - hora_inicio_cocina)) / 60.0) AS tiempo_cocina_minutos
+            SELECT id, hora_inicio_cocina, hora_fin_cocina
             FROM pedidos
-            WHERE
-                hora_inicio_cocina IS NOT NULL
-                AND hora_fin_cocina IS NOT NULL
-                AND hora_inicio_cocina >= %s
-                AND hora_fin_cocina <= %s
-                AND estado IN ('Listo', 'Entregado', 'Pagado')
-            ORDER BY hora_fin_cocina;
+            WHERE hora_inicio_cocina IS NOT NULL
+              AND hora_fin_cocina IS NOT NULL
+              AND fecha_hora >= %s
+              AND fecha_hora < %s
+              AND estado IN ('Listo', 'Entregado', 'Pagado')
+            ORDER BY fecha_hora
         """
         cursor.execute(query, (start_date, end_date))
-        pedidos_db = cursor.fetchall()
+        rows = cursor.fetchall()
 
-        if not pedidos_db:
-            log.info("Eficiencia cocina → No hay pedidos completados con tiempos registrados en el rango")
-            return {"promedio_minutos": 0, "detalle_pedidos": [], "total_pedidos": 0}
+        if not rows:
+            return {
+                "promedio_minutos": 0,
+                "total_pedidos": 0,
+                "mas_rapido_min": 0,
+                "mas_lento_min": 0,
+                "detalle_pedidos": []
+            }
 
-        tiempos = [float(row['tiempo_cocina_minutos']) for row in pedidos_db]
+        tiempos = []
+        detalle = []
+
+        for row in rows:
+            inicio = row['hora_inicio_cocina']
+            fin = row['hora_fin_cocina']
+            if isinstance(inicio, str):
+                inicio = datetime.fromisoformat(inicio.replace("Z", "+00:00"))
+            if isinstance(fin, str):
+                fin = datetime.fromisoformat(fin.replace("Z", "+00:00"))
+            
+            minutos = (fin - inicio).total_seconds() / 60
+            tiempos.append(minutos)
+            detalle.append({"id": row['id'], "tiempo": round(minutos, 1)})
+
         promedio = sum(tiempos) / len(tiempos)
         mas_rapido = min(tiempos)
         mas_lento = max(tiempos)
 
-        detalle = [
-            {"id": row['id'], "tiempo": round(row['tiempo_cocina_minutos'], 1)}
-            for row in pedidos_db
-        ]
-
-        log.info(f"EFICIENCIA COCINA → {len(pedidos_db)} pedidos | Promedio: {promedio:.1f} min | Rápido: {mas_rapido:.1f} min | Lento: {mas_lento:.1f} min")
+        log.info(f"EFICIENCIA → {len(tiempos)} pedidos | Promedio: {promedio:.1f} min")
 
         return {
             "promedio_minutos": round(promedio, 1),
-            "total_pedidos": len(pedidos_db),
+            "total_pedidos": len(tiempos),
             "mas_rapido_min": round(mas_rapido, 1),
             "mas_lento_min": round(mas_lento, 1),
             "detalle_pedidos": detalle
         }
-# --- FIN NUEVO ENDPOINT ---
+
+@app.delete("/mesas/limpiar_fisicas")
+def limpiar_mesas_fisicas(conn=Depends(get_db)):
+    try:
+        with conn.cursor() as cursor:
+            # CASCADE se encarga de borrar los pedidos asociados
+            cursor.execute("DELETE FROM mesas WHERE numero != 99")
+            eliminadas = cursor.rowcount
+            conn.commit()
+        log.info(f"CONFIGURACIÓN INICIAL → {eliminadas} mesas físicas eliminadas (pedidos asociados también)")
+        return {"status": "ok", "eliminadas": eliminadas}
+    except Exception as e:
+        log.error(f"Error crítico al limpiar mesas: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/menu/todo")
+def limpiar_menu_completo(conn=Depends(get_db)):
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM menu")
+            eliminados = cursor.rowcount
+            conn.commit()
+        log.info(f"Menú completo limpiado → {eliminados} ítems eliminados")
+        return {"status": "ok", "message": "Menú limpiado correctamente"}
+    except Exception as e:
+        log.error(f"Error al limpiar menú: {e}")
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/mesas")
+def crear_mesa(mesa: dict, conn=Depends(get_db)):
+    try:
+        numero = int(mesa["numero"])
+        capacidad = int(mesa["capacidad"])
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO mesas (numero, capacidad) 
+                VALUES (%s, %s)
+                ON CONFLICT (numero) DO UPDATE SET capacidad = %s
+            """, (numero, capacidad, capacidad))
+            conn.commit()
+        log.info(f"Mesa creada/actualizada → Mesa {numero} - Capacidad: {capacidad}")
+        return {"status": "ok"}
+    except Exception as e:
+        log.error(f"Error al crear mesa: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Lista de clientes conectados (frontend)
+connected_clients: List[WebSocket] = []
+
+@app.websocket("/ws/alertas")
+async def websocket_alertas(websocket: WebSocket):
+    await websocket.accept()
+    connected_clients.append(websocket)
+    log.info(f"Cliente WebSocket conectado → Total: {len(connected_clients)}")
+    
+    try:
+        while True:
+            # Mantener vivo el socket (opcional)
+            data = await websocket.receive_text()
+            # Puedes ignorar mensajes o usar para ping
+    except WebSocketDisconnect:
+        connected_clients.remove(websocket)
+        log.info(f"Cliente WebSocket desconectado → Quedan: {len(connected_clients)}")
+    except Exception as e:
+        log.error(f"Error en WebSocket: {e}")
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
+
+# Función para enviar alerta a TODOS los clientes conectados
+async def broadcast_alerta(tipo: str, datos: dict):
+    if connected_clients:
+        mensaje = {"tipo": tipo, "datos": datos, "timestamp": datetime.now().isoformat()}
+        dead_clients = []
+        for client in connected_clients:
+            try:
+                await client.send_json(mensaje)
+            except:
+                dead_clients.append(client)
+        # Limpiar clientes muertos
+        for client in dead_clients:
+            connected_clients.remove(client)

@@ -1,0 +1,166 @@
+-- =====================================================
+-- BASE DE DATOS RESTIA - VERSIÓN FINAL 2025
+-- Incluye: alertas en tiempo real, eficiencia cocina, stock bajo, reservas
+-- 100% compatible con tu backend y frontend actual
+-- =====================================================
+
+-- 1. Crear base de datos (opcional, si no existe)
+-- CREATE DATABASE restaurant_db;
+
+-- 2. Conectar a la base
+-- \c restaurant_db;
+
+-- =====================================================
+-- ELIMINAR TODO PARA EMPEZAR LIMPIO (opcional pero recomendado)
+-- =====================================================
+DROP TABLE IF EXISTS ingredientes_recetas CASCADE;
+DROP TABLE IF EXISTS recetas CASCADE;
+DROP TABLE IF EXISTS pedidos CASCADE;
+DROP TABLE IF EXISTS reservas CASCADE;
+DROP TABLE IF EXISTS menu CASCADE;
+DROP TABLE IF EXISTS inventario CASCADE;
+DROP TABLE IF EXISTS clientes CASCADE;
+DROP TABLE IF EXISTS mesas CASCADE;
+
+-- =====================================================
+-- TABLAS PRINCIPALES
+-- =====================================================
+
+-- Clientes
+CREATE TABLE clientes (
+    id SERIAL PRIMARY KEY,
+    nombre VARCHAR(255) NOT NULL,
+    domicilio TEXT,
+    celular VARCHAR(20),
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Mesas (físicas + virtual 99)
+CREATE TABLE mesas (
+    id SERIAL PRIMARY KEY,
+    numero INTEGER NOT NULL UNIQUE,
+    capacidad INTEGER NOT NULL DEFAULT 1 CHECK (capacidad > 0),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Menú
+CREATE TABLE menu (
+    id SERIAL PRIMARY KEY,
+    nombre VARCHAR(255) NOT NULL UNIQUE,
+    precio DECIMAL(10, 2) NOT NULL CHECK (precio >= 0),
+    tipo VARCHAR(100),
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Inventario con alerta personalizada
+CREATE TABLE inventario (
+    id SERIAL PRIMARY KEY,
+    nombre VARCHAR(255) NOT NULL UNIQUE,
+    descripcion TEXT,
+    cantidad_disponible DECIMAL(10, 2) NOT NULL DEFAULT 0 CHECK (cantidad_disponible >= 0),
+    unidad_medida VARCHAR(50) DEFAULT 'unidad',
+    cantidad_minima DECIMAL(10, 2) DEFAULT 0,
+    cantidad_minima_alerta DECIMAL(10, 2) NOT NULL DEFAULT 5.0 CHECK (cantidad_minima_alerta >= 0),
+    fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Recetas
+CREATE TABLE recetas (
+    id SERIAL PRIMARY KEY,
+    nombre_plato VARCHAR(255) NOT NULL UNIQUE,
+    descripcion TEXT,
+    instrucciones TEXT,
+    fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    fecha_actualizacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (nombre_plato) REFERENCES menu(nombre) ON DELETE CASCADE
+);
+
+-- Ingredientes por receta
+CREATE TABLE ingredientes_recetas (
+    id SERIAL PRIMARY KEY,
+    receta_id INTEGER NOT NULL,
+    ingrediente_id INTEGER NOT NULL,
+    cantidad_necesaria DECIMAL(10, 2) NOT NULL CHECK (cantidad_necesaria > 0),
+    unidad_medida_necesaria VARCHAR(50) NOT NULL,
+    FOREIGN KEY (receta_id) REFERENCES recetas(id) ON DELETE CASCADE,
+    FOREIGN KEY (ingrediente_id) REFERENCES inventario(id) ON DELETE RESTRICT,
+    UNIQUE (receta_id, ingrediente_id)
+);
+
+-- Pedidos con tiempos de cocina
+CREATE TABLE pedidos (
+    id SERIAL PRIMARY KEY,
+    mesa_numero INTEGER NOT NULL,
+    cliente_id INTEGER,
+    estado VARCHAR(50) NOT NULL DEFAULT 'Tomando pedido' 
+        CHECK (estado IN ('Tomando pedido', 'Pendiente', 'En preparacion', 'Listo', 'Entregado', 'Pagado')),
+    fecha_hora TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    items JSONB NOT NULL DEFAULT '[]'::jsonb,
+    numero_app INTEGER,
+    notas TEXT DEFAULT '',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    hora_inicio_cocina TIMESTAMP NULL,
+    hora_fin_cocina TIMESTAMP NULL,
+    FOREIGN KEY (mesa_numero) REFERENCES mesas(numero) ON DELETE CASCADE,
+    FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE SET NULL
+);
+
+-- Reservas
+CREATE TABLE reservas (
+    id SERIAL PRIMARY KEY,
+    mesa_numero INTEGER NOT NULL,
+    cliente_id INTEGER NOT NULL,
+    fecha_hora_inicio TIMESTAMP NOT NULL,
+    fecha_hora_fin TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (mesa_numero) REFERENCES mesas(numero) ON DELETE CASCADE,
+    FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE CASCADE
+);
+
+-- =====================================================
+-- ÍNDICES PARA RENDIMIENTO
+-- =====================================================
+CREATE INDEX IF NOT EXISTS idx_pedidos_estado_fecha ON pedidos (estado, fecha_hora DESC);
+CREATE INDEX IF NOT EXISTS idx_pedidos_mesa ON pedidos (mesa_numero);
+CREATE INDEX IF NOT EXISTS idx_inventario_stock ON inventario (cantidad_disponible, cantidad_minima_alerta);
+CREATE INDEX IF NOT EXISTS idx_reservas_fecha ON reservas (fecha_hora_inicio);
+
+-- =====================================================
+-- DATOS DE PRUEBA (tu menú real + ingredientes)
+-- =====================================================
+
+-- Mesas por defecto
+INSERT INTO mesas (numero, capacidad) VALUES
+(1,2),(2,2),(3,4),(4,4),(5,6),(6,6),(99,100)
+ON CONFLICT (numero) DO NOTHING;
+
+-- Clientes de prueba
+INSERT INTO clientes (nombre, domicilio, celular) VALUES
+('Juan Pérez', 'Calle Falsa 123', '5551234567'),
+('María López', 'Av. Principal 456', '5559876543')
+ON CONFLICT DO NOTHING;
+
+-- Menú completo (tu menú real)
+INSERT INTO menu (nombre, precio, tipo) VALUES
+('Empanada Kunai', 70.00, 'Entradas'),
+('Dedos de queso (5pz)', 75.00, 'Entradas'),
+('Yakimeshi Especial', 150.00, 'Arroces'),
+('Camarones roca', 160.00, 'Platillos'),
+('California Roll', 100.00, 'Naturales'),
+('Kunai Especial', 150.00, 'Gratinados'),
+('Te refil', 35.00, 'Bebidas'),
+('Coca-cola', 35.00, 'Bebidas')
+ON CONFLICT (nombre) DO NOTHING;
+
+-- Inventario de ejemplo
+INSERT INTO inventario (nombre, cantidad_disponible, unidad_medida, cantidad_minima_alerta) VALUES
+('Arroz', 20.0, 'kg', 5.0),
+('Camaron', 15.0, 'kg', 3.0),
+('Queso Philadelphia', 10.0, 'kg', 2.0),
+('Aguacate', 30.0, 'pieza', 8.0)
+ON CONFLICT (nombre) DO NOTHING;
+
+-- =====================================================
+-- ¡LISTO! TU BASE DE DATOS ESTÁ 100% ACTUALIZADA
+-- =====================================================

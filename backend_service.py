@@ -161,3 +161,39 @@ class BackendService:
         response = self._request("get", "/reportes/eficiencia_cocina", params=params)
         log.info(f"EFICIENCIA DE COCINA OBTENIDA → {tipo} | Promedio: {response.json().get('promedio_minutos', '?')} min")
         return response.json()
+
+    def crear_mesa(self, numero: int, capacidad: int) -> Dict[str, Any]:
+        payload = {"numero": numero, "capacidad": capacidad}
+        response = self._request("post", "/mesas", json=payload)
+        log.info(f"MESA CREADA → Mesa {numero} | Capacidad: {capacidad} personas")
+        return response.json()
+
+    def obtener_eficiencia_cocina(self, tipo: str, fecha: datetime) -> Dict[str, Any]:
+        """
+        Obtiene datos de eficiencia de cocina para un periodo (diario, semanal, etc.)
+        """
+        # Calcular fechas según tipo
+        if tipo == "Diario":
+            start_date = fecha.strftime("%Y-%m-%d")
+            end_date = (fecha + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif tipo == "Semanal":
+            start = fecha - timedelta(days=fecha.weekday())
+            end = start + timedelta(days=6)
+            start_date = start.strftime("%Y-%m-%d")
+            end_date = (end + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif tipo == "Mensual":
+            start_date = fecha.replace(day=1).strftime("%Y-%m-%d")
+            next_month = fecha.replace(day=1) + timedelta(days=32)
+            end_date = next_month.replace(day=1).strftime("%Y-%m-%d")
+        elif tipo == "Anual":
+            start_date = fecha.replace(month=1, day=1).strftime("%Y-%m-%d")
+            end_date = fecha.replace(month=12, day=31).strftime("%Y-%m-%d")
+        else:
+            start_date = end_date = fecha.strftime("%Y-%m-%d")
+
+        response = self._request(
+            "get",
+            "/reportes/eficiencia_cocina",
+            params={"tipo": tipo, "start_date": start_date, "end_date": end_date}
+        )
+        return response.json()
