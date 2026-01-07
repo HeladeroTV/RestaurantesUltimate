@@ -1273,39 +1273,3 @@ def crear_mesa(mesa: dict, conn=Depends(get_db)):
     except Exception as e:
         log.error(f"Error al crear mesa: {e}")
         raise HTTPException(status_code=400, detail=str(e))
-
-# Lista de clientes conectados (frontend)
-connected_clients: List[WebSocket] = []
-
-@app.websocket("/ws/alertas")
-async def websocket_alertas(websocket: WebSocket):
-    await websocket.accept()
-    connected_clients.append(websocket)
-    log.info(f"Cliente WebSocket conectado → Total: {len(connected_clients)}")
-    
-    try:
-        while True:
-            # Mantener vivo el socket (opcional)
-            data = await websocket.receive_text()
-            # Puedes ignorar mensajes o usar para ping
-    except WebSocketDisconnect:
-        connected_clients.remove(websocket)
-        log.info(f"Cliente WebSocket desconectado → Quedan: {len(connected_clients)}")
-    except Exception as e:
-        log.error(f"Error en WebSocket: {e}")
-        if websocket in connected_clients:
-            connected_clients.remove(websocket)
-
-# Función para enviar alerta a TODOS los clientes conectados
-async def broadcast_alerta(tipo: str, datos: dict):
-    if connected_clients:
-        mensaje = {"tipo": tipo, "datos": datos, "timestamp": datetime.now().isoformat()}
-        dead_clients = []
-        for client in connected_clients:
-            try:
-                await client.send_json(mensaje)
-            except:
-                dead_clients.append(client)
-        # Limpiar clientes muertos
-        for client in dead_clients:
-            connected_clients.remove(client)

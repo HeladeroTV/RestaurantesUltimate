@@ -1087,24 +1087,21 @@ def crear_vista_personalizacion(app_instance):
     log.info("Vista de Personalización creada correctamente")
     return vista
 
-# === CLASE: RestauranteGUI ===
+# === CLASE: RestauranteGUI (MODIFICADA PARA ALERTAS EN TIEMPO REAL) ===
 # Clase principal que maneja la interfaz gráfica y los estados del sistema.
 class RestauranteGUI:
     def __init__(self):
         log.info("Iniciando RestauranteGUI - Creando instancia principal")
-
         self.carpeta_datos = Path.home() / ".restaurantia" / "datos"
         self.carpeta_datos.mkdir(parents=True, exist_ok=True)
         self.archivo_primera_config = self.carpeta_datos / "PRIMERA_CONFIGURACION_COMPLETADA"
 
         from backend_service import BackendService
         from configuraciones_service import ConfiguracionesService
-        
         self.backend_service = BackendService()
         self.inventory_service = InventoryService()
         self.config_service = ConfiguracionesService()
         self.recetas_service = RecetasService()
-        
         self.page = None
         self.mesas_grid = None
         self.panel_gestion = None
@@ -1120,20 +1117,20 @@ class RestauranteGUI:
         self.hilo_sincronizacion = None
         
         # Alertas de stock
-        self.hilo_verificacion_stock = None
+        self.hilo_verificacion_stock = None  # Eliminado en la nueva versión
         self.hay_stock_bajo = False
         self.ingredientes_bajos_lista = []
         self.mostrar_detalle_stock = False
         
         # Alertas de retrasos
-        self.hilo_verificacion_retrasos = None
+        self.hilo_verificacion_retrasos = None  # Eliminado en la nueva versión
         self.lista_alertas_retrasos = []
         self.hay_pedidos_atrasados = False
         self.mostrar_detalle_retrasos = False
         
         # Configuración
         self.tiempo_umbral_minutos = 20
-        self.umbral_stock_bajo = 5
+        self.umbral_stock_bajo = 5  # Este se usará como fallback si no hay umbral personalizado
         
         # Colores
         self.PRIMARY = "#6366f1"
@@ -1147,6 +1144,12 @@ class RestauranteGUI:
         self.reservas_service = ReservasService()
         self.vista_reservas = None
         
+        # Atributos para control de verificación en tiempo real
+        self.ultimo_check_stock = 0
+        self.ultimo_check_retrasos = 0
+        self.stock_actual = {}
+        self.pedidos_activos_actual = {}
+        
         # Cargar configuración al inicio
         self.cargar_configuracion()
         log.info("RestauranteGUI inicializado correctamente")
@@ -1156,19 +1159,15 @@ class RestauranteGUI:
         log.debug("Cargando configuración desde archivo local")
         import json
         from pathlib import Path
-        
         carpeta_datos = Path.home() / ".restaurantia" / "datos"
         carpeta_datos.mkdir(parents=True, exist_ok=True)
         archivo_config = carpeta_datos / "config.json"
-
         if archivo_config.exists():
             try:
                 with open(archivo_config, "r", encoding="utf-8") as f:
                     config = json.load(f)
-                    
                 self.tiempo_umbral_minutos = config.get("tiempo_umbral_minutos", 20)
                 self.umbral_stock_bajo = config.get("umbral_stock_bajo", 5)
-                
                 log.info(f"Configuración cargada → Umbral retraso: {self.tiempo_umbral_minutos} min | Umbral stock: {self.umbral_stock_bajo}")
             except Exception as e:
                 log.error(f"Error al leer config.json: {e} → Usando valores por defecto")
@@ -1183,11 +1182,9 @@ class RestauranteGUI:
         log.debug("Guardando configuración en archivo local")
         import json
         from pathlib import Path
-        
         carpeta_datos = Path.home() / ".restaurantia" / "datos"
         carpeta_datos.mkdir(parents=True, exist_ok=True)
         archivo_config = carpeta_datos / "config.json"
-
         config = {
             "tiempo_umbral_minutos": self.tiempo_umbral_minutos,
             "umbral_stock_bajo": self.umbral_stock_bajo
@@ -1199,153 +1196,179 @@ class RestauranteGUI:
         except Exception as e:
             log.error(f"Error crítico al guardar configuración: {e}")
 
-    # --- FUNCIÓN: verificar_stock_periodicamente ---
-    def verificar_stock_periodicamente(self):
-        log.info("Hilo de verificación de stock bajo iniciado (cada 30s)")
-        while True:
-            try:
-                items = self.inventory_service.obtener_inventario()
-                ingredientes_bajos = [
-                    item for item in items 
-                    if item['cantidad_disponible'] <= self.umbral_stock_bajo
-                ]
-
+    # === FUNCIÓN: verificar_stock_real_time (nueva función) ===
+    def verificar_stock_real_time(self):
+        """Verifica stock en tiempo real solo cuando cambia"""
+        try:
+            items = self.inventory_service.obtener_inventario()
+            nuevo_stock = {item['id']: item for item in items}
+            
+            # Detectar cambios
+            cambio_detectado = False
+            for item_id, item in nuevo_stock.items():
+                if item_id not in self.stock_actual:
+                    cambio_detectado = True
+                    break
+                if (self.stock_actual[item_id]['cantidad_disponible'] != item['cantidad_disponible'] or 
+                    self.stock_actual[item_id].get('cantidad_minima_alerta', 5.0) != item.get('cantidad_minima_alerta', 5.0)):
+                    cambio_detectado = True
+                    break
+            
+            if cambio_detectado:
+                # Verificar stock bajo usando el umbral personalizado de cada ítem
+                ingredientes_bajos = []
+                for item in items:
+                    # Usar el umbral personalizado de cada ítem, con fallback al general
+                    umbral = item.get('cantidad_minima_alerta', self.umbral_stock_bajo)
+                    if item['cantidad_disponible'] <= umbral:
+                        ingredientes_bajos.append(item)
+                
                 if ingredientes_bajos:
                     nombres = ", ".join([item['nombre'] for item in ingredientes_bajos])
                     self.hay_stock_bajo = True
                     self.ingredientes_bajos_lista = [item['nombre'] for item in ingredientes_bajos]
-                    log.warning(f"STOCK BAJO DETECTADO → {len(ingredientes_bajos)} ingredientes: {nombres}")
+                    log.warning(f"STOCK BAJO DETECTADO (en tiempo real) → {len(ingredientes_bajos)} ingredientes: {nombres}")
                 else:
                     if self.hay_stock_bajo:
-                        log.info("Stock bajo resuelto - Todos los ingredientes por encima del umbral")
-                    self.hay_stock_bajo = False
-                    self.ingredientes_bajos_lista = []
-                    self.mostrar_detalle_stock = False
-
-                time.sleep(30)
-            except Exception as e:
-                log.error(f"Error en hilo de verificación de stock: {e}")
-                time.sleep(30)
-
-    # --- FUNCIÓN: verificar_retrasos_periodicamente ---
-    def verificar_retrasos_periodicamente(self):
-        log.info("Hilo de verificación de retrasos iniciado (cada 60s)")
-        while True:
-            try:
-                pedidos_activos = self.backend_service.obtener_pedidos_activos()
-                ahora = datetime.now()
+                        log.info("Stock bajo resuelto (en tiempo real) - Todos los ingredientes por encima del umbral")
+                        self.hay_stock_bajo = False
+                        self.ingredientes_bajos_lista = []
+                        self.mostrar_detalle_stock = False
                 
-                activos_relevantes = [
-                    p for p in pedidos_activos 
-                    if p.get('estado') in ["Pendiente", "En preparacion"] and p.get('items')
-                ]
+                # Actualizar cache
+                self.stock_actual = nuevo_stock
+                
+                # Actualizar visibilidad de alertas inmediatamente
+                if hasattr(self, 'actualizar_visibilidad_alerta'):
+                    self.actualizar_visibilidad_alerta()
+                    
+        except Exception as e:
+            log.error(f"Error en verificación de stock en tiempo real: {e}")
 
-                # Limpiar alertas viejas
-                alertas_vigentes = []
-                for alerta in self.lista_alertas_retrasos:
-                    pedido = next((p for p in activos_relevantes if p['id'] == alerta['id_pedido']), None)
-                    if pedido:
-                        try:
-                            fecha_pedido = datetime.strptime(pedido['fecha_hora'].split(".")[0], "%Y-%m-%d %H:%M:%S")
-                            mins_retraso = (ahora - fecha_pedido).total_seconds() / 60
-                            if mins_retraso >= self.tiempo_umbral_minutos:
-                                alerta['tiempo_retraso'] = round(mins_retraso, 1)
-                                alertas_vigentes.append(alerta)
-                        except:
-                            pass
-                    # Si no está o ya no está atrasado → se elimina automáticamente
+    def verificar_retrasos_real_time(self):
+        """Verifica retrasos en tiempo real - FUNCIONA SIEMPRE aunque el backend no devuelva updated_at"""
+        try:
+            pedidos_activos = self.backend_service.obtener_pedidos_activos()
+            ahora = datetime.now()
 
-                self.lista_alertas_retrasos = alertas_vigentes
+            # Forzar detección de cambios usando ID + estado + items (infalible)
+            nuevo_hash = {}
+            for p in pedidos_activos:
+                items_str = str(sorted([f"{i['nombre']}{i['precio']}" for i in p.get('items', [])]))
+                clave = f"{p['id']}_{p.get('estado','')}_{items_str}"
+                nuevo_hash[p['id']] = clave
 
-                # Generar nuevas alertas
-                for pedido in activos_relevantes:
-                    if pedido['id'] in [a['id_pedido'] for a in alertas_vigentes]:
+            # Detectar cualquier cambio (aunque no haya updated_at)
+            cambios_detectados = (
+                set(nuevo_hash.keys()) != set(self.pedidos_activos_actual.keys()) or
+                any(nuevo_hash.get(pid) != self.pedidos_activos_actual.get(pid) for pid in nuevo_hash)
+            )
+
+            if not cambios_detectados and self.pedidos_activos_actual:
+                return  # Solo si realmente no cambió nada
+
+            # === AQUÍ SÍ ENTRA SIEMPRE QUE HAYA UN PEDIDO NUEVO O CAMBIO ===
+
+            activos_relevantes = [
+                p for p in pedidos_activos
+                if p.get('estado') in ["Pendiente", "En preparacion"] and p.get('items')
+            ]
+
+            alertas_nuevas = []
+            for pedido in activos_relevantes:
+                try:
+                    fecha_str = str(pedido.get('fecha_hora', '')).split('.')[0]
+                    if not fecha_str or len(fecha_str) < 10:
                         continue
-                    try:
-                        fecha_pedido = datetime.strptime(pedido['fecha_hora'].split(".")[0], "%Y-%m-%d %H:%M:%S")
-                        mins_retraso = (ahora - fecha_pedido).total_seconds() / 60
-                        if mins_retraso >= self.tiempo_umbral_minutos:
-                            titulo = obtener_titulo_pedido(pedido)
-                            self.lista_alertas_retrasos.append({
-                                "id_pedido": pedido['id'],
-                                "titulo_pedido": titulo,
-                                "estado": pedido['estado'],
-                                "tiempo_retraso": round(mins_retraso, 1),
-                                "fecha_hora": fecha_pedido
-                            })
-                            log.warning(f"PEDIDO ATRASADO → {titulo} | {mins_retraso:.1f} min (umbral: {self.tiempo_umbral_minutos})")
-                    except:
-                        continue
+                    fecha_pedido = datetime.strptime(fecha_str, "%Y-%m-%d %H:%M:%S")
+                    minutos_transcurridos = (ahora - fecha_pedido).total_seconds() / 60
 
-                self.hay_pedidos_atrasados = len(self.lista_alertas_retrasos) > 0
+                    if minutos_transcurridos >= self.tiempo_umbral_minutos:
+                        titulo = obtener_titulo_pedido(pedido)
+                        alertas_nuevas.append({
+                            "id_pedido": pedido['id'],
+                            "titulo_pedido": titulo,
+                            "estado": pedido['estado'],
+                            "tiempo_retraso": round(minutos_transcurridos, 1)
+                        })
+                        log.warning(f"ALERTA RETRASO → {titulo} | {minutos_transcurridos:.1f} min (umbral: {self.tiempo_umbral_minutos})")
 
-                time.sleep(60)
-            except Exception as e:
-                log.error(f"Error crítico en hilo de retrasos: {e}")
-                time.sleep(60)
+                except Exception as e:
+                    log.error(f"Error procesando pedido {pedido.get('id')} para retraso: {e}")
 
+            self.lista_alertas_retrasos = alertas_nuevas
+            self.hay_pedidos_atrasados = len(alertas_nuevas) > 0
+            self.pedidos_activos_actual = nuevo_hash
+
+            if hasattr(self, 'actualizar_visibilidad_alerta'):
+                self.actualizar_visibilidad_alerta()
+
+        except Exception as e:
+            log.error(f"Error crítico en verificar_retrasos_real_time: {e}")
+
+    # === FUNCIÓN: verificar_todo_real_time (nueva función central) ===
+    def verificar_todo_real_time(self):
+        """Verifica todo en tiempo real - Se llama cada vez que se actualiza la UI"""
+        # Verificar stock
+        self.verificar_stock_real_time()
+        # Verificar retrasos  
+        self.verificar_retrasos_real_time()
 
     def iniciar_sincronizacion(self):
         """Inicia la sincronización automática en segundo plano."""
         log.info("Iniciando hilos de sincronización automática")
-
+        
         def actualizar_periodicamente():
             while True:
                 try:
+                    # Verificar alertas en tiempo real ANTES de actualizar la UI
+                    self.verificar_todo_real_time()
+                    # Ahora actualizar la UI con los estados de alerta actualizados
                     self.actualizar_ui_completo()
                     time.sleep(3)
                 except Exception as e:
                     log.error(f"Error crítico en hilo de sincronización UI: {e}")
                     time.sleep(3)
-
+        
         # Hilo principal de UI
         self.hilo_sincronizacion = threading.Thread(target=actualizar_periodicamente, daemon=True)
         self.hilo_sincronizacion.start()
-        log.info("Hilo de sincronización UI iniciado (cada 3s)")
-
-        # Hilo de stock
-        self.hilo_verificacion_stock = threading.Thread(target=self.verificar_stock_periodicamente, daemon=True)
-        self.hilo_verificacion_stock.start()
-        log.info("Hilo de verificación de stock bajo iniciado (cada 30s)")
-
-        # Hilo de retrasos
-        self.hilo_verificacion_retrasos = threading.Thread(target=self.verificar_retrasos_periodicamente, daemon=True)
-        self.hilo_verificacion_retrasos.start()
-        log.info("Hilo de verificación de pedidos atrasados iniciado (cada 60s)")
-
-        log.info("Todos los hilos de fondo iniciados correctamente")
+        log.info("Hilo de sincronización UI iniciado (cada 3s) con verificación de alertas en tiempo real")
+        
+        # NOTA: Ya no iniciamos los hilos separados de verificación periódica
+        # porque ahora se hace en el mismo hilo de actualización de UI
 
     def main(self, page: ft.Page):
         log.info("main() ejecutado - Iniciando interfaz gráfica RestIA")
-        
         self.page = page
         page.title = "RestIA"
         page.padding = 0
         page.theme_mode = "dark"
         page.bgcolor = "#0a0e1a"
         
+        # Asignar la instancia a la página para acceso desde vistas
+        page.app_instance = self
+        
         reloj = ft.Text("", size=14, weight=ft.FontWeight.BOLD, color=ft.Colors.AMBER_200)
-
+        
         # =================================================================
         # === ASISTENTE DE PRIMERA CONFIGURACIÓN (SOLO SE MUESTRA 1 VEZ) ===
         # =================================================================
         if not self.archivo_primera_config.exists():
             page.title = "RestIA - Configuración Inicial"
             page.bgcolor = "#0f172a"
-            
             from bienvenida_view import BienvenidaConfiguracion
-            
             page.views.clear()
             page.views.append(BienvenidaConfiguracion(self, page).vista)
             page.update()
             log.info("PRIMERA VEZ - Mostrando asistente de configuración inicial")
             return  # ¡¡SUPER IMPORTANTE!! No ejecutar nada más
-
         # =================================================================
         # === CONFIGURACIÓN YA REALIZADA → CARGAR SISTEMA NORMAL ===
         # =================================================================
+        
         log.info("Configuración previa detectada - Cargando sistema completo")
-
+        
         # === CARGA INICIAL DEL MENÚ ===
         try:
             self.menu_cache = self.backend_service.obtener_menu()
@@ -1353,8 +1376,7 @@ class RestauranteGUI:
         except Exception as e:
             log.error(f"Error al cargar menú al iniciar: {e}")
             self.menu_cache = []
-
-
+        
         # === INDICADORES DE ALERTA ===
         indicador_stock_bajo = ft.Container(
             content=ft.Row([
@@ -1370,7 +1392,6 @@ class RestauranteGUI:
             ink=True,
             on_click=self.toggle_detalle_stock_bajo
         )
-
         indicador_retrasos = ft.Container(
             content=ft.Row([
                 ft.Icon(ft.Icons.ALARM, color=ft.Colors.WHITE, size=20),
@@ -1385,7 +1406,6 @@ class RestauranteGUI:
             ink=True,
             on_click=self.toggle_detalle_retrasos
         )
-
         panel_detalle_stock = ft.Container(
             content=ft.Column([
                 ft.Text("Ingredientes con bajo stock:", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
@@ -1397,7 +1417,6 @@ class RestauranteGUI:
             visible=False,
             width=220,
         )
-
         panel_detalle_retrasos = ft.Container(
             content=ft.Column([
                 ft.Text("Pedidos con retraso:", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
@@ -1409,21 +1428,19 @@ class RestauranteGUI:
             visible=False,
             width=220,
         )
-
+        
         # === RELOJ EN VIVO ===
         def actualizar_reloj():
             reloj.value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             page.update()
-
         def loop_reloj():
             while True:
                 actualizar_reloj()
                 time.sleep(1)
-
         hilo_reloj = threading.Thread(target=loop_reloj, daemon=True)
         hilo_reloj.start()
         log.info("Hilo del reloj en vivo iniciado")
-
+        
         # === CARGA INICIAL DEL MENÚ ===
         try:
             self.menu_cache = self.backend_service.obtener_menu()
@@ -1431,7 +1448,7 @@ class RestauranteGUI:
         except Exception as e:
             log.error(f"Error al cargar menú al iniciar: {e}")
             self.menu_cache = []
-
+        
         # === CREACIÓN DE TODAS LAS VISTAS ===
         log.debug("Creando todas las vistas de la aplicación")
         self.mesas_grid = crear_mesas_grid(self.backend_service, self.seleccionar_mesa)
@@ -1457,9 +1474,8 @@ class RestauranteGUI:
             self.actualizar_ui_completo, page
         )
         self.vista_personalizacion = crear_vista_personalizacion(self)
-
+        
         log.info("Todas las vistas creadas correctamente - Aplicación lista")
-
         
         tabs = ft.Tabs(
             selected_index=0,
@@ -1478,8 +1494,9 @@ class RestauranteGUI:
             ],
             expand=1
         )
+        
         log.info("Pestañas principales creadas - 10 módulos activos")
-
+        
         def actualizar_visibilidad_alerta():
             # Stock bajo
             indicador_stock_bajo.visible = self.hay_stock_bajo
@@ -1489,8 +1506,8 @@ class RestauranteGUI:
             if self.hay_stock_bajo:
                 for ing in self.ingredientes_bajos_lista:
                     lista_detalle_stock.controls.append(ft.Text(f"- {ing}", size=12, color=ft.Colors.WHITE))
-                log.debug(f"Indicador Stock Bajo activado → {len(self.ingredientes_bajos_lista)} ingredientes")
-
+            log.debug(f"Indicador Stock Bajo activado → {len(self.ingredientes_bajos_lista)} ingredientes")
+            
             # Retrasos
             indicador_retrasos.visible = self.hay_pedidos_atrasados
             panel_detalle_retrasos.visible = self.hay_pedidos_atrasados and self.mostrar_detalle_retrasos
@@ -1501,10 +1518,10 @@ class RestauranteGUI:
                     lista_detalle_retrasos.controls.append(
                         ft.Text(f"- {alerta['titulo_pedido']} ({alerta['tiempo_retraso']} min)", size=12, color=ft.Colors.WHITE)
                     )
-                log.debug(f"Indicador Retrasos activado → {len(self.lista_alertas_retrasos)} pedidos atrasados")
-
+            log.debug(f"Indicador Retrasos activado → {len(self.lista_alertas_retrasos)} pedidos atrasados")
+            
             page.update()
-
+        
         page.add(
             ft.Stack(
                 controls=[
@@ -1535,14 +1552,14 @@ class RestauranteGUI:
                 expand=True
             )
         )
+        
         log.info("Interfaz gráfica principal renderizada - Stack con pestañas y alertas")
-
+        
         # INICIAR TODO
         self.iniciar_sincronizacion()
         self.actualizar_ui_completo()
         actualizar_visibilidad_alerta()
         self.actualizar_visibilidad_alerta = actualizar_visibilidad_alerta
-
         log.info("¡APLICACIÓN RESTIA INICIADA CORRECTAMENTE! - Todo listo y funcionando")
         log.info("=" * 60)
 
@@ -1575,45 +1592,46 @@ class RestauranteGUI:
         if self.panel_gestion:
             self.panel_gestion.seleccionar_mesa(numero_mesa)
 
-    def actualizar_ui_completo(self): 
+    def actualizar_ui_completo(self):
         log.debug("↻ actualizar_ui_completo() llamado - Iniciando refresco completo de UI")
+        
         nuevo_grid = crear_mesas_grid(self.backend_service, self.seleccionar_mesa)
         self.mesas_grid.controls = nuevo_grid.controls
         self.mesas_grid.update()
         log.debug("Grid de mesas recreado y actualizado")
-
+        
         if hasattr(self.vista_cocina, 'actualizar'):
             self.vista_cocina.actualizar()
-            log.debug("Vista Cocina actualizada")
-
+        log.debug("Vista Cocina actualizada")
+        
         if hasattr(self.vista_caja, 'actualizar'):
             self.vista_caja.actualizar()
-            log.debug("Vista Caja actualizada")
-
+        log.debug("Vista Caja actualizada")
+        
         if hasattr(self.vista_admin, 'actualizar_lista_clientes'):
             self.vista_admin.actualizar_lista_clientes()
-            log.debug("Lista de clientes en Administración actualizada")
-
+        log.debug("Lista de clientes en Administración actualizada")
+        
         if hasattr(self.vista_recetas, 'actualizar_datos'):
             self.vista_recetas.actualizar_datos()
-            log.debug("Vista Recetas actualizada")
-
+        log.debug("Vista Recetas actualizada")
+        
         if hasattr(self.vista_inventario, 'actualizar_lista'):
             self.vista_inventario.actualizar_lista()
-            log.debug("Lista de inventario actualizada")
-
+        log.debug("Lista de inventario actualizada")
+        
         if hasattr(self, 'actualizar_visibilidad_alerta'):
             self.actualizar_visibilidad_alerta()
-            log.debug("Visibilidad de alertas de stock y retrasos actualizada")
-
+        log.debug("Visibilidad de alertas de stock y retrasos actualizada")
+        
         self.page.update()
         log.debug("page.update() ejecutado - UI refrescada completamente")
-
+        
         if hasattr(self.vista_reservas, 'cargar_clientes_mesas'):
             pass  # Aquí puedes descomentar cuando lo implementes
             # self.vista_reservas.cargar_clientes_mesas()
-            log.debug("Vista Reservas lista para actualizar (método disponible)")
-
+        log.debug("Vista Reservas lista para actualizar (método disponible)")
+        
         log.info("✓ Actualización completa de UI finalizada con éxito")
 
     # --- FUNCIÓN: actualizar_lista_inventario ---
@@ -1627,7 +1645,7 @@ class RestauranteGUI:
                 return
         if hasattr(self.vista_inventario, 'actualizar_lista'):
             self.vista_inventario.actualizar_lista()
-            log.debug("Lista de inventario forzada a actualizar (sin edición activa)")
+        log.debug("Lista de inventario forzada a actualizar (sin edición activa)")
 
     # --- NUEVA FUNCIÓN: toggle_detalle_stock_bajo ---
     def toggle_detalle_stock_bajo(self, e):
@@ -1643,108 +1661,100 @@ class RestauranteGUI:
         log.info(f"Detalle de retrasos {'MOSTRADO' if self.mostrar_detalle_retrasos else 'OCULTADO'} por el usuario")
         self.actualizar_ui_completo()
 
-# === FUNCIÓN: crear_vista_personalizacion ===
-def crear_vista_personalizacion(app_instance):
-    """
-    Crea la vista de personalización para umbrales de alerta.
-    Args:
-        app_instance (RestauranteGUI): Instancia de la aplicación principal.
-    Returns:
-        ft.Container: Contenedor con la interfaz de personalización.
-    """
-    log.debug("Creando vista de Personalización de Alertas")
+    # === FUNCIÓN: crear_vista_personalizacion ===
+    def crear_vista_personalizacion(self, app_instance):
+        """
+        Crea la vista de personalización para umbrales de alerta.
+        Args:
+            app_instance (RestauranteGUI): Instancia de la aplicación principal.
+        Returns:
+            ft.Container: Contenedor con la interfaz de personalización.
+        """
+        log.debug("Creando vista de Personalización de Alertas")
+        tiempo_umbral_input = ft.TextField(
+            label="Tiempo umbral para pedidos (minutos)",
+            value=str(app_instance.tiempo_umbral_minutos),
+            width=300,
+            input_filter=ft.NumbersOnlyInputFilter(),
+            hint_text="Ej: 20"
+        )
+        stock_umbral_input = ft.TextField(
+            label="Cantidad umbral para stock bajo",
+            value=str(app_instance.umbral_stock_bajo),
+            width=300,
+            input_filter=ft.NumbersOnlyInputFilter(),
+            hint_text="Ej: 5"
+        )
 
-    tiempo_umbral_input = ft.TextField(
-        label="Tiempo umbral para pedidos (minutos)",
-        value=str(app_instance.tiempo_umbral_minutos),
-        width=300,
-        input_filter=ft.NumbersOnlyInputFilter(),
-        hint_text="Ej: 20"
-    )
-    stock_umbral_input = ft.TextField(
-        label="Cantidad umbral para stock bajo",
-        value=str(app_instance.umbral_stock_bajo),
-        width=300,
-        input_filter=ft.NumbersOnlyInputFilter(),
-        hint_text="Ej: 5"
-    )
+        def guardar_configuracion_click(e):
+            """Guarda los nuevos umbrales ingresados."""
+            log.info("Usuario hizo clic en 'Guardar Configuración' en Personalización")
+            try:
+                nuevo_tiempo_umbral = int(tiempo_umbral_input.value)
+                nuevo_stock_umbral = int(stock_umbral_input.value)
+                if nuevo_tiempo_umbral <= 0 or nuevo_stock_umbral < 0:
+                    log.warning(f"Intento de guardar umbrales inválidos → Tiempo: {nuevo_tiempo_umbral} | Stock: {nuevo_stock_umbral}")
+                    def cerrar_alerta(e):
+                        app_instance.page.close(dlg_error)
+                    dlg_error = ft.AlertDialog(
+                        title=ft.Text("Error"),
+                        content=ft.Text("Los umbrales deben ser números positivos (tiempo > 0, stock ≥ 0)."),
+                        actions=[ft.TextButton("Aceptar", on_click=cerrar_alerta)],
+                    )
+                    app_instance.page.dialog = dlg_error
+                    dlg_error.open = True
+                    app_instance.page.update()
+                    return
 
-    def guardar_configuracion_click(e):
-        """Guarda los nuevos umbrales ingresados."""
-        log.info("Usuario hizo clic en 'Guardar Configuración' en Personalización")
-        try:
-            nuevo_tiempo_umbral = int(tiempo_umbral_input.value)
-            nuevo_stock_umbral = int(stock_umbral_input.value)
+                viejo_tiempo = app_instance.tiempo_umbral_minutos
+                viejo_stock = app_instance.umbral_stock_bajo
+                app_instance.tiempo_umbral_minutos = nuevo_tiempo_umbral
+                app_instance.umbral_stock_bajo = nuevo_stock_umbral
+                app_instance.guardar_configuracion()
+                log.info(f"CONFIGURACIÓN ACTUALIZADA → Tiempo: {viejo_tiempo}→{nuevo_tiempo_umbral} min | Stock: {viejo_stock}→{nuevo_stock_umbral}")
 
-            if nuevo_tiempo_umbral <= 0 or nuevo_stock_umbral < 0:
-                log.warning(f"Intento de guardar umbrales inválidos → Tiempo: {nuevo_tiempo_umbral} | Stock: {nuevo_stock_umbral}")
-                def cerrar_alerta(e):
-                    app_instance.page.close(dlg_error)
-                
-                dlg_error = ft.AlertDialog(
-                    title=ft.Text("Error"),
-                    content=ft.Text("Los umbrales deben ser números positivos (tiempo > 0, stock ≥ 0)."),
-                    actions=[ft.TextButton("Aceptar", on_click=cerrar_alerta)],
+                def cerrar_alerta_ok(e):
+                    app_instance.page.close(dlg_success)
+                dlg_success = ft.AlertDialog(
+                    title=ft.Text("¡Éxito!", color=ft.Colors.GREEN),
+                    content=ft.Text("Configuración guardada correctamente.", color=ft.Colors.GREEN_200),
+                    actions=[ft.TextButton("Aceptar", on_click=cerrar_alerta_ok)],
                 )
-                app_instance.page.dialog = dlg_error
-                dlg_error.open = True
+                app_instance.page.dialog = dlg_success
+                dlg_success.open = True
                 app_instance.page.update()
-                return
+            except ValueError as ve:
+                log.error(f"Error de conversión en personalización: {tiempo_umbral_input.value} | {stock_umbral_input.value}")
+                def cerrar_alerta_val(e):
+                    app_instance.page.close(dlg_error_val)
+                dlg_error_val = ft.AlertDialog(
+                    title=ft.Text("Error"),
+                    content=ft.Text("Por favor, ingrese solo números enteros."),
+                    actions=[ft.TextButton("Aceptar", on_click=cerrar_alerta_val)],
+                )
+                app_instance.page.dialog = dlg_error_val
+                dlg_error_val.open = True
+                app_instance.page.update()
 
-            viejo_tiempo = app_instance.tiempo_umbral_minutos
-            viejo_stock = app_instance.umbral_stock_bajo
-
-            app_instance.tiempo_umbral_minutos = nuevo_tiempo_umbral
-            app_instance.umbral_stock_bajo = nuevo_stock_umbral
-            app_instance.guardar_configuracion()
-
-            log.info(f"CONFIGURACIÓN ACTUALIZADA → Tiempo: {viejo_tiempo}→{nuevo_tiempo_umbral} min | Stock: {viejo_stock}→{nuevo_stock_umbral}")
-
-            def cerrar_alerta_ok(e):
-                app_instance.page.close(dlg_success)
-            
-            dlg_success = ft.AlertDialog(
-                title=ft.Text("¡Éxito!", color=ft.Colors.GREEN),
-                content=ft.Text("Configuración guardada correctamente.", color=ft.Colors.GREEN_200),
-                actions=[ft.TextButton("Aceptar", on_click=cerrar_alerta_ok)],
-            )
-            app_instance.page.dialog = dlg_success
-            dlg_success.open = True
-            app_instance.page.update()
-
-        except ValueError as ve:
-            log.error(f"Error de conversión en personalización: {tiempo_umbral_input.value} | {stock_umbral_input.value}")
-            def cerrar_alerta_val(e):
-                app_instance.page.close(dlg_error_val)
-            
-            dlg_error_val = ft.AlertDialog(
-                title=ft.Text("Error"),
-                content=ft.Text("Por favor, ingrese solo números enteros."),
-                actions=[ft.TextButton("Aceptar", on_click=cerrar_alerta_val)],
-            )
-            app_instance.page.dialog = dlg_error_val
-            dlg_error_val.open = True
-            app_instance.page.update()
-
-    vista = ft.Container(
-        content=ft.Column([
-            ft.Text("Personalización de Alertas", size=24, weight=ft.FontWeight.BOLD),
-            ft.Divider(),
-            ft.Text("Establece los umbrales para las alertas de retraso de pedidos y bajo stock.", size=16),
-            ft.Divider(),
-            tiempo_umbral_input,
-            stock_umbral_input,
-            ft.ElevatedButton(
-                "Guardar Configuración",
-                on_click=guardar_configuracion_click,
-                style=ft.ButtonStyle(bgcolor=app_instance.PRIMARY, color=ft.Colors.WHITE)
-            )
-        ]),
-        padding=20,
-        expand=True
-    )
-    log.info("Vista de Personalización creada y lista")
-    return vista
+        vista = ft.Container(
+            content=ft.Column([
+                ft.Text("Personalización de Alertas", size=24, weight=ft.FontWeight.BOLD),
+                ft.Divider(),
+                ft.Text("Establece los umbrales para las alertas de retraso de pedidos y bajo stock.", size=16),
+                ft.Divider(),
+                tiempo_umbral_input,
+                stock_umbral_input,
+                ft.ElevatedButton(
+                    "Guardar Configuración",
+                    on_click=guardar_configuracion_click,
+                    style=ft.ButtonStyle(bgcolor=app_instance.PRIMARY, color=ft.Colors.WHITE)
+                )
+            ]),
+            padding=20,
+            expand=True
+        )
+        log.info("Vista de Personalización creada y lista")
+        return vista
 
 
 def main():
