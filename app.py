@@ -706,11 +706,10 @@ def crear_panel_gestion(backend_service, menu, on_update_ui, page, primary_color
     log.info("Panel de gestión de pedidos creado correctamente")
     return panel
 
-# === FUNCIÓN: crear_vista_cocina ===
+# === FUNCIÓN: crear_vista_cocina (MODIFICADA PARA DETECCIÓN DE RETRASOS EN TIEMPO REAL) ===
 # Vista de cocina para ver y gestionar pedidos activos.
 def crear_vista_cocina(backend_service, on_update_ui, page):
-    log.debug("Creando vista de Cocina")
-    
+    log.debug("Creando vista de Cocina (versión con detección de retrasos)")
     lista_pedidos = ft.ListView(
         expand=1,
         spacing=10,
@@ -718,13 +717,65 @@ def crear_vista_cocina(backend_service, on_update_ui, page):
         auto_scroll=True,
     )
 
+    # Variables para almacenar alertas de retraso detectadas en esta vista
+    alertas_retraso_vista = []
+
     def actualizar():
+        nonlocal alertas_retraso_vista
         try:
             pedidos = backend_service.obtener_pedidos_activos()
             pendientes = sum(1 for p in pedidos if p.get("estado") == "Pendiente")
             en_preparacion = sum(1 for p in pedidos if p.get("estado") == "En preparacion")
-            
             log.info(f"Actualizando vista Cocina | Pendientes: {pendientes} | En preparación: {en_preparacion}")
+
+            # Detectar retrasos en pedidos activos
+            ahora = datetime.now()
+            alertas_retraso_vista.clear() # Limpiar alertas anteriores de esta vista
+            for pedido in pedidos:
+                if pedido.get("estado") in ["Pendiente", "En preparacion"] and pedido.get("items"):
+                    try:
+                        # Parsear la fecha del pedido
+                        fecha_pedido_str = pedido.get('fecha_hora', '')
+                        if fecha_pedido_str:
+                            fecha_pedido = datetime.strptime(fecha_pedido_str.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                            mins_retraso = (ahora - fecha_pedido).total_seconds() / 60
+
+                            # Supongamos que la instancia principal tiene el umbral
+                            # (esto se obtiene de la página o de una variable global si no es accesible directamente aquí)
+                            # Por ahora, usaremos un valor fijo o uno pasado como parámetro si es posible
+                            # OJO: Esto es un punto crítico. La mejor forma es pasar el umbral desde la instancia principal.
+                            # Por simplicidad temporal, usaremos 20 minutos como ejemplo.
+                            # Lo ideal es poder acceder a app_instance.tiempo_umbral_minutos
+                            umbral_retraso = 20 # Este valor debería venir de la instancia principal de la app
+
+                            # Intentar acceder al umbral desde la instancia principal si está disponible
+                            if hasattr(page, 'app_instance') and hasattr(page.app_instance, 'tiempo_umbral_minutos'):
+                                 umbral_retraso = page.app_instance.tiempo_umbral_minutos
+                            else:
+                                log.warning("No se pudo acceder al umbral de retraso desde la página. Usando valor por defecto (20 min).")
+
+                            if mins_retraso >= umbral_retraso:
+                                titulo = obtener_titulo_pedido(pedido)
+                                alertas_retraso_vista.append({
+                                    "id_pedido": pedido['id'],
+                                    "titulo_pedido": titulo,
+                                    "estado": pedido['estado'],
+                                    "tiempo_retraso": round(mins_retraso, 1),
+                                    "fecha_hora": fecha_pedido
+                                })
+                                log.warning(f"PEDIDO ATRASADO DETECTADO EN VISTA COCINA (en tiempo real) → {titulo} | {mins_retraso:.1f} min (umbral: {umbral_retraso})")
+                    except ValueError:
+                        log.error(f"Error al parsear fecha_hora del pedido ID {pedido.get('id', 'N/A')}: {fecha_pedido_str}")
+                        continue # Saltar este pedido si hay error en la fecha
+
+            # Actualizar indicadores de alerta globales si hay alertas detectadas en esta vista
+            hay_retrasos = len(alertas_retraso_vista) > 0
+            if hasattr(page, 'app_instance'):
+                 page.app_instance.hay_pedidos_atrasados = hay_retrasos
+                 page.app_instance.lista_alertas_retrasos = alertas_retraso_vista
+                 # Forzar actualización de visibilidad de alertas
+                 if hasattr(page.app_instance, 'actualizar_visibilidad_alerta'):
+                     page.app_instance.actualizar_visibilidad_alerta()
 
             lista_pedidos.controls.clear()
             for pedido in pedidos:
@@ -738,11 +789,15 @@ def crear_vista_cocina(backend_service, on_update_ui, page):
         pedido_id = pedido["id"]
         origen = f"{obtener_titulo_pedido(pedido)} - {pedido.get('fecha_hora', 'Sin fecha')[-8:]}"
 
+        # Marcar como atrasado si está en la lista de alertas
+        pedido_atrasado = any(a['id_pedido'] == pedido_id for a in alertas_retraso_vista)
+        bg_color_pedido = ft.Colors.RED_700 if pedido_atrasado else ft.Colors.BLUE_GREY_900
+
         def cambiar_estado(e, p, nuevo_estado):
             try:
                 backend_service.actualizar_estado_pedido(p["id"], nuevo_estado)
                 log.info(f"Estado cambiado → Pedido {p['id']} | {p.get('estado','?')} → {nuevo_estado}")
-                on_update_ui()
+                on_update_ui() # Esto debería disparar la actualización de alertas
             except Exception as ex:
                 log.error(f"Error al cambiar estado del pedido {p['id']} a '{nuevo_estado}': {ex}")
 
@@ -750,7 +805,7 @@ def crear_vista_cocina(backend_service, on_update_ui, page):
             try:
                 backend_service.eliminar_pedido(pedido["id"])
                 log.warning(f"Pedido ELIMINADO por cocina → ID: {pedido_id} | {origen}")
-                on_update_ui()
+                on_update_ui() # Esto debería disparar la actualización de alertas
             except Exception as ex:
                 log.error(f"Error al eliminar pedido {pedido_id} desde cocina: {ex}")
 
@@ -786,7 +841,7 @@ def crear_vista_cocina(backend_service, on_update_ui, page):
                 ]),
                 ft.Text(f"Estado: {pedido.get('estado', 'Pendiente')}", color=ft.Colors.BLUE_200)
             ]),
-            bgcolor=ft.Colors.BLUE_GREY_900,
+            bgcolor=bg_color_pedido, # Color dinámico según estado de retraso
             padding=10,
             border_radius=10,
         )
@@ -800,7 +855,7 @@ def crear_vista_cocina(backend_service, on_update_ui, page):
         expand=True
     )
     vista.actualizar = actualizar
-    log.info("Vista de Cocina creada correctamente")
+    log.info("Vista de Cocina (versión con detección de retrasos) creada correctamente")
     return vista
 
 def crear_vista_admin(backend_service, menu, on_update_ui, page):
