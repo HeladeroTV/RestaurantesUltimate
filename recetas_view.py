@@ -262,6 +262,10 @@ def crear_vista_recetas(recetas_service, menu_service, inventario_service, on_up
         padding=20,
         expand=True
     )
+    
+    # === AGREGA ESTA LÍNEA ===
+    vista.actualizar_datos = actualizar_datos 
+    # =========================
 
     # vista.cargar_clientes_mesas = cargar_clientes_mesas # Si decides usarlo
     return vista

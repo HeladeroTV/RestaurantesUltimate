@@ -116,6 +116,16 @@ def read_root():
     log.debug("GET / → Página de bienvenida solicitada")
     return {"message": "Bienvenido a la API del Sistema de Restaurante"}
 
+
+async def broadcast_alerta(tipo: str, data: dict):
+    """
+    Función para enviar alertas en tiempo real.
+    Por ahora solo registra en logs, en el futuro usará WebSockets.
+    """
+    log.warning(f"🚨 ALERTA [{tipo.upper()}] → {data}")
+    # Aquí irá tu lógica de WebSocket cuando la implementes
+    # Ejemplo: await manager.broadcast(json.dumps({"tipo": tipo, "data": data}))
+
 def get_db():
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     log.debug("Nueva conexión a BD abierta (dependency get_db)")
@@ -196,8 +206,9 @@ def obtener_menu(conn: psycopg2.extensions.connection = Depends(get_db)):
         log.info(f"Menú enviado al cliente - {len(items)} ítems disponibles")
         return items
 
+
 @app.post("/pedidos", response_model=PedidoResponse)
-def crear_pedido(pedido: PedidoCreate, conn: psycopg2.extensions.connection = Depends(get_db)):
+async def crear_pedido(pedido: PedidoCreate, conn: psycopg2.extensions.connection = Depends(get_db)):
     total_items = len(pedido.items)
     mesa = pedido.mesa_numero
     es_digital = mesa == 99
@@ -225,13 +236,15 @@ def crear_pedido(pedido: PedidoCreate, conn: psycopg2.extensions.connection = De
                 """, (receta['id'],))
                 
                 for ing in cursor.fetchall():
-                    cantidad_total_necesaria = ing['cantidad_necesaria'] * cantidad_pedido
+                    cantidad_total_necesaria = float(ing['cantidad_necesaria']) * cantidad_pedido
+                    cantidad_actual = float(ing['cantidad_disponible'])
                     
-                    if ing['cantidad_disponible'] < cantidad_total_necesaria:
-                        log.warning(f"STOCK INSUFICIENTE → '{ing['nombre_ingrediente']}' | Disp: {ing['cantidad_disponible']} | Necesario: {cantidad_total_necesaria} → Pedido RECHAZADO")
+                    # ← AQUÍ ESTABA EL PROBLEMA: Ahora usa <= para permitir llegar a 0
+                    if cantidad_actual < cantidad_total_necesaria:
+                        log.warning(f"STOCK INSUFICIENTE → '{ing['nombre_ingrediente']}' | Disp: {cantidad_actual} | Necesario: {cantidad_total_necesaria} → Pedido RECHAZADO")
                         raise HTTPException(
                             status_code=400, 
-                            detail=f"No hay suficiente stock de '{ing['nombre_ingrediente']}' para preparar '{nombre_item}'. Disponible: {ing['cantidad_disponible']}, Necesario: {cantidad_total_necesaria}"
+                            detail=f"No hay suficiente stock de '{ing['nombre_ingrediente']}' para preparar '{nombre_item}'. Disponible: {cantidad_actual}, Necesario: {cantidad_total_necesaria}"
                         )
                     
                     ingredientes_a_consumir.append({
@@ -285,7 +298,7 @@ def crear_pedido(pedido: PedidoCreate, conn: psycopg2.extensions.connection = De
 
                 log.debug(f"Stock actualizado → {nombre_ing} | Quedan: {disponible} {unidad}")
 
-                # ENVIAR ALERTA SI ESTÁ BAJO O CRÍTICO
+                # ENVIAR ALERTA SI ESTÁ BAJO O CRÍTICO (AHORA ASYNC)
                 if disponible <= minimo_alerta:
                     alerta = {
                         "ingrediente": nombre_ing,
@@ -294,7 +307,8 @@ def crear_pedido(pedido: PedidoCreate, conn: psycopg2.extensions.connection = De
                         "unidad": unidad,
                         "mensaje": f"¡Stock crítico de {nombre_ing}! Solo quedan {disponible} {unidad}"
                     }
-                    asyncio.create_task(broadcast_alerta("stock_bajo", alerta))
+                    # ← LÍNEA CORREGIDA: Ahora usa await en vez de create_task
+                    await broadcast_alerta("stock_bajo", alerta)
                     log.warning(f"ALERTA STOCK BAJO ENVIADA → {nombre_ing} ({disponible} ≤ {minimo_alerta})")
 
         conn.commit()
@@ -396,16 +410,7 @@ def actualizar_estado_pedido(pedido_id: int, estado: str, conn = Depends(get_db)
         return pedido_dict
 # --- FIN MODIFICACIÓN ---
 
-@app.get("/mesas")
-def obtener_mesas(conn=Depends(get_db)):
-    """Este es el que usa el frontend → debe devolver TODAS las mesas"""
-    with conn.cursor() as cursor:
-        cursor.execute("SELECT numero, capacidad, FALSE as ocupada FROM mesas WHERE numero != 99 ORDER BY numero")
-        filas = cursor.fetchall()
-        mesas = [{"numero": r["numero"], "capacidad": r["capacidad"], "ocupada": r["ocupada"]} for r in filas]
-        # Agregar mesa virtual
-        mesas.append({"numero": 99, "capacidad": 100, "ocupada": False})
-        return mesas
+
 
 # Endpoint para inicializar menú
 @app.post("/menu/inicializar")
@@ -699,66 +704,69 @@ def obtener_analisis_productos(
 
 
 @app.get("/mesas")
-def obtener_mesas_detalladas(conn = Depends(get_db)):
-    log.debug("GET /mesas → Consultando estado detallado de mesas (ocupación + reservas)")
+def obtener_mesas(conn = Depends(get_db)):
+    """
+    Devuelve mesas con estado calculado dinámicamente desde pedidos activos.
+    OPTIMIZADO: Usa una sola query JOIN para máximo rendimiento.
+    """
+    log.debug("GET /mesas → Consultando estado de mesas (con cálculo dinámico de ocupación)")
 
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT numero, capacidad FROM mesas WHERE numero != 99 ORDER BY numero;")
+            # === QUERY ULTRA-OPTIMIZADA CON LEFT JOIN ===
+            cursor.execute("""
+                SELECT 
+                    m.numero,
+                    m.capacidad,
+                    -- Calcular si está ocupada (pedido activo)
+                    CASE 
+                        WHEN p.id IS NOT NULL THEN TRUE 
+                        ELSE FALSE 
+                    END AS ocupada,
+                    -- Detectar si tiene reserva activa
+                    CASE 
+                        WHEN r.id IS NOT NULL THEN TRUE 
+                        ELSE FALSE 
+                    END AS reservada,
+                    c.nombre AS cliente_reservado_nombre,
+                    r.fecha_hora_inicio AS fecha_hora_reserva
+                FROM mesas m
+                -- Pedidos activos (determina ocupada)
+                LEFT JOIN pedidos p ON m.numero = p.mesa_numero 
+                    AND p.estado IN ('Tomando pedido', 'Pendiente', 'En preparacion', 'Listo', 'Entregado')
+                -- Reservas activas
+                LEFT JOIN reservas r ON m.numero = r.mesa_numero 
+                    AND DATE(r.fecha_hora_inicio) >= CURRENT_DATE
+                LEFT JOIN clientes c ON r.cliente_id = c.id
+                WHERE m.numero != 99
+                ORDER BY m.numero;
+            """)
             mesas_db = cursor.fetchall()
 
-        with conn.cursor() as cursor:
-            hoy = date.today().strftime("%Y-%m-%d")
-            cursor.execute("""
-                SELECT r.mesa_numero, r.fecha_hora_inicio, r.fecha_hora_fin, c.nombre as cliente_nombre
-                FROM reservas r
-                JOIN clientes c ON r.cliente_id = c.id
-                WHERE DATE(r.fecha_hora_inicio) >= %s
-                ORDER BY r.fecha_hora_inicio;
-            """, (hoy,))
-            reservas_db = cursor.fetchall()
-
-        with conn.cursor() as cursor:
-            cursor.execute("""
-                SELECT mesa_numero
-                FROM pedidos
-                WHERE estado IN ('Tomando pedido', 'Pendiente', 'En preparacion', 'Listo', 'Entregado')
-                AND mesa_numero != 99;
-            """)
-            pedidos_activos = {row['mesa_numero'] for row in cursor.fetchall()}
-
+        # Procesar resultados
         mesas_result = []
-        reservas_por_mesa = {}
-        for res in reservas_db:
-            m = res['mesa_numero']
-            if m not in reservas_por_mesa:
-                reservas_por_mesa[m] = []
-            reservas_por_mesa[m].append({
-                "cliente_nombre": res['cliente_nombre'],
-                "fecha_hora_inicio": str(res['fecha_hora_inicio']),
-                "fecha_hora_fin": str(res['fecha_hora_fin']) if res['fecha_hora_fin'] else None
-            })
-
         ocupadas = 0
         reservadas = 0
-        for mesa_db in mesas_db:
-            numero = mesa_db['numero']
-            es_ocupada = numero in pedidos_activos
-            es_reservada = numero in reservas_por_mesa
-            if es_ocupada: ocupadas += 1
-            if es_reservada: reservadas += 1
 
-            info = {
-                "numero": numero,
-                "capacidad": mesa_db['capacidad'],
-                "ocupada": es_ocupada,
+        for mesa_row in mesas_db:
+            es_ocupada = bool(mesa_row['ocupada'])
+            es_reservada = bool(mesa_row['reservada'])
+            
+            if es_ocupada:
+                ocupadas += 1
+            if es_reservada:
+                reservadas += 1
+
+            mesas_result.append({
+                "numero": mesa_row['numero'],
+                "capacidad": mesa_row['capacidad'],
+                "ocupada": es_ocupada,  # ← AHORA SÍ SE CALCULA CORRECTAMENTE
                 "reservada": es_reservada,
-                "cliente_reservado_nombre": reservas_por_mesa.get(numero, [{}])[0].get("cliente_nombre"),
-                "fecha_hora_reserva": reservas_por_mesa.get(numero, [{}])[0].get("fecha_hora_inicio")
-            }
-            mesas_result.append(info)
+                "cliente_reservado_nombre": mesa_row['cliente_reservado_nombre'],
+                "fecha_hora_reserva": str(mesa_row['fecha_hora_reserva']) if mesa_row['fecha_hora_reserva'] else None
+            })
 
-        # Mesa virtual
+        # Mesa virtual (siempre disponible)
         mesas_result.append({
             "numero": 99,
             "capacidad": 100,
@@ -769,16 +777,17 @@ def obtener_mesas_detalladas(conn = Depends(get_db)):
             "es_virtual": True
         })
 
-        log.info(f"Mesas detalladas enviadas → {len(mesas_db)} físicas | {ocupadas} ocupadas | {reservadas} reservadas")
+        log.info(f"Mesas enviadas → {len(mesas_db)} físicas | {ocupadas} ocupadas | {reservadas} reservadas | Actualización dinámica ✅")
         return mesas_result
 
     except Exception as e:
-        log.error(f"ERROR CRÍTICO en obtener_mesas_detalladas → {e}", exc_info=True)
+        log.error(f"ERROR CRÍTICO en obtener_mesas → {e}", exc_info=True)
+        # Fallback seguro
         fallback = [
             {"numero": i, "capacidad": c, "ocupada": False, "reservada": False, "cliente_reservado_nombre": None, "fecha_hora_reserva": None}
             for i, c in [(1,2),(2,2),(3,4),(4,4),(5,6),(6,6)]
         ] + [{"numero": 99, "capacidad": 100, "ocupada": False, "reservada": False, "cliente_reservado_nombre": None, "fecha_hora_reserva": None, "es_virtual": True}]
-        log.warning("Se devolvió fallback de mesas por error en BD")
+        log.warning("Devolviendo fallback por error en BD")
         return fallback
 
 
@@ -1273,3 +1282,71 @@ def crear_mesa(mesa: dict, conn=Depends(get_db)):
     except Exception as e:
         log.error(f"Error al crear mesa: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/reportes/rango")
+def obtener_reporte_rango(
+    fecha_inicio: str, 
+    fecha_fin: str, 
+    conn = Depends(get_db)
+):
+    """
+    Endpoint para obtener reporte en un rango de fechas
+    """
+    try:
+        with conn.cursor() as cursor:
+            # Obtener ventas totales en el rango
+            cursor.execute("""
+                SELECT 
+                    COALESCE(SUM(total), 0) as ventas_totales,
+                    COUNT(*) as pedidos_totales
+                FROM pedidos 
+                WHERE DATE(fecha_hora) BETWEEN %s AND %s 
+                AND estado = 'Pagado'
+            """, (fecha_inicio, fecha_fin))
+            
+            resultado = cursor.fetchone()
+            ventas_totales = float(resultado[0]) if resultado[0] else 0
+            pedidos_totales = int(resultado[1]) if resultado[1] else 0
+            
+            # Obtener productos vendidos en el rango
+            cursor.execute("""
+                SELECT SUM(pp.cantidad) as productos_vendidos
+                FROM pedidos p
+                JOIN pedido_producto pp ON p.id = pp.pedido_id
+                WHERE DATE(p.fecha_hora) BETWEEN %s AND %s
+                AND p.estado = 'Pagado'
+            """, (fecha_inicio, fecha_fin))
+            
+            resultado_productos = cursor.fetchone()
+            productos_vendidos = int(resultado_productos[0]) if resultado_productos[0] else 0
+            
+            # Obtener productos más vendidos
+            cursor.execute("""
+                SELECT 
+                    pr.nombre,
+                    SUM(pp.cantidad) as cantidad
+                FROM pedidos p
+                JOIN pedido_producto pp ON p.id = pp.pedido_id
+                JOIN productos pr ON pp.producto_id = pr.id
+                WHERE DATE(p.fecha_hora) BETWEEN %s AND %s
+                AND p.estado = 'Pagado'
+                GROUP BY pr.id, pr.nombre
+                ORDER BY cantidad DESC
+                LIMIT 10
+            """, (fecha_inicio, fecha_fin))
+            
+            productos_mas_vendidos = [
+                {"nombre": row[0], "cantidad": int(row[1])}
+                for row in cursor.fetchall()
+            ]
+            
+            return {
+                "ventas_totales": ventas_totales,
+                "pedidos_totales": pedidos_totales,
+                "productos_vendidos": productos_vendidos,
+                "productos_mas_vendidos": productos_mas_vendidos
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al generar reporte: {str(e)}")

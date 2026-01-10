@@ -193,6 +193,9 @@ def crear_vista_reservas(reservas_service, clientes_service, mesas_service, on_u
     # Cargar clientes al inicializar la vista
     cargar_clientes()
 
+    # --- CORRECCIÓN: Cargar reservas de "Hoy" automáticamente al iniciar ---
+    actualizar_reservas_fecha(None)
+
     vista = ft.Container(
         content=ft.Column([
             ft.Text("Gestión de Reservas", size=24, weight=ft.FontWeight.BOLD),
@@ -218,5 +221,5 @@ def crear_vista_reservas(reservas_service, clientes_service, mesas_service, on_u
         expand=True
     )
 
-    # vista.cargar_clientes_mesas = cargar_clientes_mesas # Si decides usarlo
+    vista.cargar_clientes = cargar_clientes
     return vista
